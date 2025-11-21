@@ -1,0 +1,5 @@
+{
+  "name": "jhahaword",
+  "description": "An intelligent vocabulary learning companion powered by Gemini. Generate word lists by topic, study with interactive flashcards, and test your knowledge with AI-generated quizzes.",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,538 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { AppView, Word, DailyStats } from './types';
+import TopicGenerator from './components/TopicGenerator';
+import FlashcardMode from './components/FlashcardMode';
+import QuizMode from './components/QuizMode';
+import WordList from './components/WordList';
+import { Layers, GraduationCap, BrainCircuit, ListMusic, PlusCircle, TrendingUp, BookOpen, Target, Download, Save, FileUp, Smartphone, Cloud, CloudOff, RefreshCw, AlertTriangle, Loader2 } from 'lucide-react';
+import { ComposedChart, Line, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts';
+import { initGoogleDrive, loginToGoogle, findBackupFile, uploadBackupFile, downloadBackupFile } from './services/googleDriveService';
+
+const App: React.FC = () => {
+  const [currentView, setCurrentView] = useState<AppView>(AppView.DASHBOARD);
+  const [words, setWords] = useState<Word[]>([]);
+  const [stats, setStats] = useState<Record<string, DailyStats>>({});
+  const [lastSaved, setLastSaved] = useState<Date | null>(null);
+
+  // Cloud State
+  const [isDriveInitialized, setIsDriveInitialized] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false); // For auto-save spinner
+  const [cloudFileId, setCloudFileId] = useState<string | null>(null);
+  const [conflictData, setConflictData] = useState<{ cloudDate: Date; fileId: string } | null>(null);
+
+  // Refs to prevent initial effects from overwriting timestamps immediately
+  const isLoadedRef = useRef(false);
+  const autoSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // 1. Load data from local storage on mount
+  useEffect(() => {
+    const savedWords = localStorage.getItem('lingua_spark_words');
+    if (savedWords) {
+      try {
+        setWords(JSON.parse(savedWords));
+      } catch (e) {
+        console.error("Failed to load saved words");
+      }
+    }
+
+    const savedStats = localStorage.getItem('lingua_spark_stats');
+    if (savedStats) {
+      try {
+        setStats(JSON.parse(savedStats));
+      } catch (e) {
+        console.error("Failed to load stats");
+      }
+    }
+
+    const savedTimestamp = localStorage.getItem('lingua_spark_last_saved');
+    if (savedTimestamp) {
+      setLastSaved(new Date(savedTimestamp));
+    } else {
+      setLastSaved(new Date());
+    }
+
+    // Initialize Google Drive
+    initGoogleDrive()
+      .then(() => setIsDriveInitialized(true))
+      .catch(err => console.error("Drive Init Failed", err));
+    
+    // Mark as loaded so subsequent changes trigger updates
+    setTimeout(() => { isLoadedRef.current = true; }, 100);
+  }, []);
+
+  // 2. Persist to Local Storage & Auto-Save to Cloud
+  useEffect(() => {
+    if (isLoadedRef.current) {
+      // A. Local Storage
+      localStorage.setItem('lingua_spark_words', JSON.stringify(words));
+      localStorage.setItem('lingua_spark_stats', JSON.stringify(stats));
+      const now = new Date();
+      setLastSaved(now);
+      localStorage.setItem('lingua_spark_last_saved', now.toISOString());
+
+      // B. Cloud Auto-Save (Debounced)
+      if (isLoggedIn && !conflictData) {
+        if (autoSaveTimerRef.current) {
+          clearTimeout(autoSaveTimerRef.current);
+        }
+        
+        setIsSyncing(true);
+        autoSaveTimerRef.current = setTimeout(async () => {
+          try {
+            const dataToSave = {
+              version: 1,
+              exportedAt: now.toISOString(),
+              words,
+              stats
+            };
+            const result = await uploadBackupFile(dataToSave, cloudFileId || undefined);
+            if (result && result.id) {
+              setCloudFileId(result.id);
+            }
+          } catch (err) {
+            console.error("Auto-save failed", err);
+          } finally {
+            setIsSyncing(false);
+          }
+        }, 2000); // Wait 2 seconds after last change before uploading
+      }
+    }
+  }, [words, stats, isLoggedIn, cloudFileId, conflictData]);
+
+
+  const getTodayDate = () => {
+    const d = new Date();
+    const offset = d.getTimezoneOffset();
+    const localDate = new Date(d.getTime() - (offset * 60 * 1000));
+    return localDate.toISOString().split('T')[0];
+  };
+
+  const updateDailyStats = (updateFn: (current: DailyStats) => DailyStats) => {
+    const today = getTodayDate();
+    setStats(prevStats => {
+      const currentToday = prevStats[today] || {
+        date: today,
+        wordsLearned: 0,
+        wordsReviewed: 0,
+        quizCorrect: 0,
+        quizTotal: 0
+      };
+      
+      return {
+        ...prevStats,
+        [today]: updateFn(currentToday)
+      };
+    });
+  };
+
+  const handleAddWords = (newWords: Word[]) => {
+    setWords((prev) => [...newWords, ...prev]);
+    setCurrentView(AppView.LIST);
+  };
+
+  const handleDeleteWord = (id: string) => {
+    setWords((prev) => prev.filter(w => w.id !== id));
+  };
+
+  const handleMarkLearned = (id: string) => {
+    const isLearned = words.find(w => w.id === id)?.learned;
+    setWords(prev => prev.map(w => w.id === id ? { ...w, learned: !w.learned } : w));
+    
+    if (!isLearned) {
+       updateDailyStats(s => ({ ...s, wordsLearned: s.wordsLearned + 1 }));
+    }
+  };
+
+  const handleReviewWord = (id: string) => {
+    updateDailyStats(s => ({ ...s, wordsReviewed: s.wordsReviewed + 1 }));
+  };
+
+  const handleQuizComplete = (score: number, total: number) => {
+    updateDailyStats(s => ({
+      ...s,
+      quizCorrect: s.quizCorrect + score,
+      quizTotal: s.quizTotal + total
+    }));
+  };
+
+  // --- Cloud Logic ---
+
+  const handleConnectCloud = async () => {
+    try {
+      await loginToGoogle();
+      setIsLoggedIn(true);
+      await checkCloudStatus();
+    } catch (err) {
+      console.error("Login failed", err);
+      alert("Could not connect to Google Drive. Please try again.");
+    }
+  };
+
+  const checkCloudStatus = async () => {
+    setIsSyncing(true);
+    try {
+      const file = await findBackupFile();
+      if (file) {
+        setCloudFileId(file.id);
+        const cloudTime = new Date(file.modifiedTime);
+        
+        // If cloud is significantly newer than local (allow 1 minute drift), warn user
+        if (lastSaved && cloudTime.getTime() > lastSaved.getTime() + 60000) {
+           setConflictData({ cloudDate: cloudTime, fileId: file.id });
+        }
+      }
+    } catch (err) {
+      console.error("Error checking cloud", err);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const resolveConflict = async (useCloud: boolean) => {
+    if (useCloud && conflictData) {
+      setIsSyncing(true);
+      try {
+        const data = await downloadBackupFile(conflictData.fileId);
+        if (data && data.words) {
+          setWords(data.words);
+          if (data.stats) setStats(data.stats);
+          
+          // Update local timestamps to match current so we don't loop
+          const now = new Date();
+          setLastSaved(now);
+          localStorage.setItem('lingua_spark_last_saved', now.toISOString());
+        }
+      } catch (err) {
+        alert("Failed to download cloud data.");
+      } finally {
+        setIsSyncing(false);
+      }
+    }
+    // If useCloud is false, we simply clear the conflict. 
+    // The next auto-save effect will trigger (because isLoadedRef is true) and overwrite cloud.
+    setConflictData(null);
+  };
+
+  // --- File Export/Import Logic ---
+
+  const handleExportData = () => {
+    const data = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      words,
+      stats
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `lingua-spark-backup-${getTodayDate()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportData = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const content = e.target?.result as string;
+        const data = JSON.parse(content);
+        
+        if (!data.words || !Array.isArray(data.words)) {
+          alert('Invalid backup file: Missing words data.');
+          return;
+        }
+
+        if (window.confirm(`Restore ${data.words.length} words from file?`)) {
+          setWords(data.words);
+          if (data.stats) setStats(data.stats);
+          event.target.value = '';
+        }
+      } catch (err) {
+        alert('Failed to parse backup file.');
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // --- UI Helpers ---
+
+  const dashboardData = useMemo(() => {
+    const today = new Date();
+    const days = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(today.getDate() - i);
+      const offset = d.getTimezoneOffset();
+      const localDate = new Date(d.getTime() - (offset * 60 * 1000));
+      const dateStr = localDate.toISOString().split('T')[0];
+      
+      const dayStat = stats[dateStr] || { wordsLearned: 0, wordsReviewed: 0, quizCorrect: 0, quizTotal: 0 };
+      const accuracy = dayStat.quizTotal > 0 ? Math.round((dayStat.quizCorrect / dayStat.quizTotal) * 100) : 0;
+
+      days.push({
+        date: i === 0 ? 'Today' : dateStr.slice(5),
+        learned: dayStat.wordsLearned,
+        reviewed: dayStat.wordsReviewed,
+        accuracy: accuracy
+      });
+    }
+    return days;
+  }, [stats]);
+
+  const todayStats = useMemo(() => {
+    const today = getTodayDate();
+    return stats[today] || { wordsLearned: 0, wordsReviewed: 0, quizCorrect: 0, quizTotal: 0 };
+  }, [stats]);
+
+  const renderContent = () => {
+    switch (currentView) {
+      case AppView.GENERATE:
+        return <TopicGenerator onWordsAdded={handleAddWords} />;
+      case AppView.STUDY:
+        return <FlashcardMode words={words} onMarkLearned={handleMarkLearned} onReview={handleReviewWord} />;
+      case AppView.QUIZ:
+        return <QuizMode words={words} onComplete={handleQuizComplete} />;
+      case AppView.LIST:
+        return <WordList words={words} onDelete={handleDeleteWord} />;
+      case AppView.DASHBOARD:
+      default:
+        return (
+          <div className="max-w-2xl mx-auto space-y-8 pt-4">
+            <div className="flex justify-between items-end px-2">
+              <div className="space-y-1">
+                <h1 className="text-3xl font-black text-slate-900 tracking-tight">Hello, Learner!</h1>
+                
+                {/* Status Indicators */}
+                <div className="flex flex-wrap items-center gap-3">
+                  {/* Local Status */}
+                  <div className="flex items-center gap-2 text-xs font-medium text-slate-500 bg-slate-100 px-3 py-1.5 rounded-full w-fit">
+                    <Smartphone size={14} />
+                    <span>Saved on device</span>
+                  </div>
+
+                  {/* Cloud Status */}
+                  {isLoggedIn ? (
+                    <div className={`flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-full w-fit transition-colors ${isSyncing ? 'bg-indigo-100 text-indigo-700' : 'bg-green-50 text-green-600'}`}>
+                      {isSyncing ? <RefreshCw size={14} className="animate-spin" /> : <Cloud size={14} />}
+                      <span>{isSyncing ? 'Saving to Cloud...' : 'Cloud Synced'}</span>
+                    </div>
+                  ) : (
+                    <button 
+                      onClick={handleConnectCloud}
+                      disabled={!isDriveInitialized}
+                      className="flex items-center gap-2 text-xs font-medium text-slate-500 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 px-3 py-1.5 rounded-full w-fit transition-colors"
+                    >
+                      <CloudOff size={14} />
+                      <span>{isDriveInitialized ? 'Connect Cloud' : 'Loading Cloud...'}</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Chart */}
+            <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
+              <div className="flex items-center gap-2 mb-6">
+                <TrendingUp className="text-indigo-600" size={20} />
+                <h2 className="font-bold text-slate-800">7-Day Activity & Performance</h2>
+              </div>
+              <div className="h-64 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={dashboardData} margin={{ top: 5, right: 5, bottom: 5, left: -20 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                    <XAxis 
+                      dataKey="date" 
+                      axisLine={false} 
+                      tickLine={false} 
+                      tick={{fontSize: 10, fill: '#94a3b8'}} 
+                      dy={10}
+                    />
+                    <YAxis 
+                      yAxisId="left"
+                      axisLine={false} 
+                      tickLine={false} 
+                      tick={{fontSize: 10, fill: '#94a3b8'}} 
+                    />
+                    <YAxis 
+                      yAxisId="right"
+                      orientation="right"
+                      axisLine={false} 
+                      tickLine={false} 
+                      tick={{fontSize: 10, fill: '#94a3b8'}}
+                      unit="%" 
+                      domain={[0, 100]}
+                    />
+                    <Tooltip 
+                      cursor={{fill: '#f8fafc'}}
+                      contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)'}}
+                    />
+                    <Legend wrapperStyle={{ paddingTop: '20px' }} />
+                    <Bar yAxisId="left" dataKey="learned" name="Learned" fill="#4f46e5" radius={[4, 4, 0, 0]} barSize={12} />
+                    <Bar yAxisId="left" dataKey="reviewed" name="Reviewed" fill="#cbd5e1" radius={[4, 4, 0, 0]} barSize={12} />
+                    <Line yAxisId="right" type="monotone" dataKey="accuracy" name="Quiz Accuracy" stroke="#f59e0b" strokeWidth={3} dot={{r: 4, fill: "#f59e0b", strokeWidth: 2, stroke: "#fff"}} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* Stats Grid */}
+            <div className="grid grid-cols-3 gap-3">
+               <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center text-center space-y-1">
+                  <div className="p-2 bg-green-100 text-green-600 rounded-xl mb-1"><CheckCircleIcon size={20} /></div>
+                  <div className="text-2xl font-black text-slate-800">{todayStats.wordsLearned}</div>
+                  <div className="text-slate-400 font-bold text-[10px] uppercase tracking-wide">Learned</div>
+               </div>
+               <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center text-center space-y-1">
+                  <div className="p-2 bg-orange-100 text-orange-600 rounded-xl mb-1"><BookOpen size={20} /></div>
+                  <div className="text-2xl font-black text-slate-800">{todayStats.wordsReviewed}</div>
+                  <div className="text-slate-400 font-bold text-[10px] uppercase tracking-wide">Reviewed</div>
+               </div>
+               <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center text-center space-y-1">
+                  <div className="p-2 bg-blue-100 text-blue-600 rounded-xl mb-1"><Target size={20} /></div>
+                  <div className="text-2xl font-black text-slate-800">
+                    {todayStats.quizTotal > 0 
+                      ? Math.round((todayStats.quizCorrect / todayStats.quizTotal) * 100) + '%' 
+                      : '-'}
+                  </div>
+                  <div className="text-slate-400 font-bold text-[10px] uppercase tracking-wide">Quiz Accuracy</div>
+               </div>
+            </div>
+
+            {/* Quick Actions */}
+            <div className="grid gap-4">
+              <button 
+                onClick={() => setCurrentView(AppView.GENERATE)}
+                className="group relative overflow-hidden p-6 bg-slate-900 text-white rounded-3xl shadow-xl hover:shadow-2xl transition-all text-left"
+              >
+                 <div className="relative z-10 flex items-center gap-4">
+                    <div className="p-3 bg-white/10 rounded-2xl backdrop-blur-sm">
+                      <PlusCircle size={28} />
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-bold">Add New Words</h3>
+                      <p className="text-slate-400 text-sm">Build your vocabulary</p>
+                    </div>
+                 </div>
+              </button>
+            </div>
+
+            {/* Data Management */}
+            <div className="bg-white border border-slate-200 rounded-3xl p-6">
+              <h3 className="font-bold text-slate-800 mb-1 flex items-center gap-2">
+                <Save size={20} className="text-slate-400" /> Manual File Backup
+              </h3>
+              <p className="text-slate-400 text-xs mb-4">
+                Export your progress to a JSON file or restore from one.
+              </p>
+              <div className="flex gap-3">
+                <button
+                  onClick={handleExportData}
+                  className="flex-1 bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 py-3 px-4 rounded-xl font-medium flex items-center justify-center gap-2 transition-colors"
+                >
+                  <Download size={18} /> Save File
+                </button>
+                <label className="flex-1 bg-white hover:bg-indigo-50 text-indigo-600 border border-indigo-200 py-3 px-4 rounded-xl font-medium flex items-center justify-center gap-2 transition-colors cursor-pointer">
+                  <FileUp size={18} /> Load File
+                  <input
+                    type="file"
+                    className="hidden"
+                    accept=".json"
+                    onChange={handleImportData}
+                  />
+                </label>
+              </div>
+            </div>
+
+          </div>
+        );
+    }
+  };
+
+  const NavButton = ({ view, icon: Icon, label }: { view: AppView; icon: any; label: string }) => (
+    <button
+      onClick={() => setCurrentView(view)}
+      className={`flex flex-col items-center gap-1 p-2 rounded-xl transition-colors ${
+        currentView === view ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:text-slate-600'
+      }`}
+    >
+      <Icon size={24} strokeWidth={currentView === view ? 2.5 : 2} />
+      <span className="text-[10px] font-medium">{label}</span>
+    </button>
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900 font-sans pb-24">
+      {/* Cloud Conflict Modal */}
+      {conflictData && (
+        <div className="fixed inset-0 z-[100] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-8 max-w-sm w-full shadow-2xl">
+            <div className="w-12 h-12 bg-amber-100 text-amber-600 rounded-full flex items-center justify-center mb-4 mx-auto">
+              <AlertTriangle size={24} />
+            </div>
+            <h3 className="text-xl font-bold text-center text-slate-900 mb-2">Cloud Data Found</h3>
+            <p className="text-slate-500 text-center text-sm mb-6">
+              We found a newer backup on your cloud drive ({conflictData.cloudDate.toLocaleDateString()} {conflictData.cloudDate.toLocaleTimeString()}). 
+              Would you like to restore it?
+            </p>
+            <div className="space-y-3">
+              <button 
+                onClick={() => resolveConflict(true)}
+                disabled={isSyncing}
+                className="w-full py-3 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 flex justify-center items-center gap-2"
+              >
+                {isSyncing ? <Loader2 className="animate-spin" size={18}/> : <Download size={18}/>}
+                Yes, Restore Cloud Data
+              </button>
+              <button 
+                onClick={() => resolveConflict(false)}
+                disabled={isSyncing}
+                className="w-full py-3 bg-white border border-slate-200 text-slate-600 rounded-xl font-bold hover:bg-slate-50"
+              >
+                No, Keep Local Data
+              </button>
+            </div>
+            <p className="text-xs text-slate-400 text-center mt-4">
+              Keeping local data will overwrite the cloud backup next time.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <main className="max-w-4xl mx-auto px-4 py-6">
+        {renderContent()}
+      </main>
+
+      {/* Bottom Navigation */}
+      <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-100 px-6 py-3 pb-6 shadow-[0_-4px_20px_rgba(0,0,0,0.03)] z-50">
+        <div className="max-w-md mx-auto flex justify-between items-center">
+           <NavButton view={AppView.DASHBOARD} icon={GraduationCap} label="Home" />
+           <NavButton view={AppView.STUDY} icon={Layers} label="Study" />
+           <div className="relative -top-8">
+             <button 
+                onClick={() => setCurrentView(AppView.GENERATE)}
+                className="bg-indigo-600 text-white p-4 rounded-full shadow-xl hover:bg-indigo-700 transition-transform hover:scale-105"
+             >
+               <PlusCircle size={28} />
+             </button>
+           </div>
+           <NavButton view={AppView.QUIZ} icon={BrainCircuit} label="Quiz" />
+           <NavButton view={AppView.LIST} icon={ListMusic} label="List" />
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Helper icon for dashboard
+const CheckCircleIcon = ({size}: {size: number}) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+);
+
+export default App;
